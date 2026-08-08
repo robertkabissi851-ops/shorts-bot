@@ -1,0 +1,28 @@
+name: Générer un Short
+
+# Déclenché à distance par le Worker Cloudflare via repository_dispatch
+on:
+  repository_dispatch:
+    types: [new_short]
+
+jobs:
+  build-short:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Afficher le script reçu (debug)
+        run: |
+          echo "Script reçu :"
+          echo "${{ github.event.client_payload.script }}"
+          echo "Chat ID Telegram : ${{ github.event.client_payload.chat_id }}"
+
+      # --- Étapes futures à ajouter ici, dans l'ordre ---
+      # - name: Générer la voix off (edge-tts)
+      # - name: Télécharger les clips (API Pexels)
+      # - name: Assembler la vidéo (FFmpeg)
+      # - name: Envoyer la vidéo finie sur Telegram
+
+      - name: Confirmer sur Telegram (test de la chaîne complète)
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ github.event.client_payload.chat_id }}" \
+            -d text="✅ Test réussi : Telegram → Worker → GitHub Actions → Telegram fonctionne. Prochaine étape : ajouter la voix off."
