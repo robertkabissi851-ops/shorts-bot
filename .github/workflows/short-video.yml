@@ -9,20 +9,61 @@ jobs:
   build-short:
     runs-on: ubuntu-latest
     steps:
-      - name: Afficher le script reçu (debug)
+      # On écrit le script reçu dans un fichier via une variable d'env plutôt que
+      # de l'interpoler directement dans le shell — évite tout risque d'injection
+      # si le texte envoyé contient des caractères spéciaux (", $, `, etc.)
+      - name: Écrire le script reçu dans un fichier
+        env:
+          SCRIPT_TEXT: ${{ github.event.client_payload.script }}
         run: |
-          echo "Script reçu :"
-          echo "${{ github.event.client_payload.script }}"
-          echo "Chat ID Telegram : ${{ github.event.client_payload.chat_id }}"
+          printf '%s' "$SCRIPT_TEXT" > script.txt
+          echo "Script écrit dans script.txt :"
+          cat script.txt
+
+      - name: Installer Python et les dépendances
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet edge-tts langdetect
+
+      - name: Générer la voix off (edge-tts)
+        run: |
+          python3 <<'EOF'
+          from langdetect import detect
+          import subprocess
+
+          with open("script.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+
+          try:
+              lang = detect(text)
+          except Exception:
+              lang = "fr"  # repli par défaut si la détection échoue
+
+          # Voix masculines dynamiques edge-tts
+          voices = {
+              "fr": "fr-FR-HenriNeural",
+              "en": "en-US-GuyNeural",
+          }
+          voice = voices.get(lang, voices["fr"])
+
+          print(f"Langue détectée : {lang} -> voix choisie : {voice}")
+
+          subprocess.run([
+              "edge-tts",
+              "--voice", voice,
+              "--text", text,
+              "--write-media", "voix_off.mp3"
+          ], check=True)
+          EOF
 
       # --- Étapes futures à ajouter ici, dans l'ordre ---
-      # - name: Générer la voix off (edge-tts)
       # - name: Télécharger les clips (API Pexels)
       # - name: Assembler la vidéo (FFmpeg)
       # - name: Envoyer la vidéo finie sur Telegram
 
-      - name: Confirmer sur Telegram (test de la chaîne complète)
+      - name: Envoyer la voix off sur Telegram (validation intermédiaire)
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ github.event.client_payload.chat_id }}" \
-            -d text="✅ Test réussi : Telegram → Worker → GitHub Actions → Telegram fonctionne. Prochaine étape : ajouter la voix off."
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendAudio" \
+            -F chat_id="${{ github.event.client_payload.chat_id }}" \
+            -F audio=@voix_off.mp3 \
+            -F caption="🎙️ Voix off générée. Prochaine étape : les clips vidéo + montage."
