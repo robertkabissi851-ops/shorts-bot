@@ -23,7 +23,7 @@ jobs:
       - name: Installer Python et les dépendances
         run: |
           python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet edge-tts langdetect
+          python3 -m pip install --quiet edge-tts langdetect yake requests
 
       - name: Générer la voix off (edge-tts)
         run: |
@@ -38,6 +38,10 @@ jobs:
               lang = detect(text)
           except Exception:
               lang = "fr"  # repli par défaut si la détection échoue
+
+          # On sauvegarde la langue détectée pour la réutiliser dans les étapes suivantes
+          with open("lang.txt", "w") as f:
+              f.write(lang)
 
           # Voix masculines dynamiques edge-tts
           voices = {
@@ -56,14 +60,93 @@ jobs:
           ], check=True)
           EOF
 
-      # --- Étapes futures à ajouter ici, dans l'ordre ---
-      # - name: Télécharger les clips (API Pexels)
-      # - name: Assembler la vidéo (FFmpeg)
-      # - name: Envoyer la vidéo finie sur Telegram
-
-      - name: Envoyer la voix off sur Telegram (validation intermédiaire)
+      - name: Extraire les mots-clés du script (yake)
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendAudio" \
-            -F chat_id="${{ github.event.client_payload.chat_id }}" \
-            -F audio=@voix_off.mp3 \
-            -F caption="🎙️ Voix off générée. Prochaine étape : les clips vidéo + montage."
+          python3 <<'EOF'
+          import yake
+
+          with open("script.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+          with open("lang.txt", "r") as f:
+              lang = f.read().strip()
+
+          # yake ne connaît que "fr"/"en" etc., déjà compatible avec langdetect
+          extractor = yake.KeywordExtractor(lan=lang, n=1, top=5, dedupLim=0.9)
+          keywords = [kw for kw, score in extractor.extract_keywords(text)]
+
+          if not keywords:
+              keywords = ["nature", "ville", "mouvement"]  # repli si extraction vide
+
+          print("Mots-clés extraits :", keywords)
+
+          with open("keywords.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(keywords))
+          EOF
+
+      - name: Télécharger les clips vidéo (API Pexels)
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          python3 <<'EOF'
+          import os
+          import requests
+
+          api_key = os.environ["PEXELS_API_KEY"]
+          headers = {"Authorization": api_key}
+
+          with open("keywords.txt", "r", encoding="utf-8") as f:
+              keywords = [line.strip() for line in f if line.strip()]
+
+          downloaded = []
+
+          for i, keyword in enumerate(keywords):
+              try:
+                  resp = requests.get(
+                      "https://api.pexels.com/videos/search",
+                      headers=headers,
+                      params={"query": keyword, "orientation": "portrait", "per_page": 1},
+                      timeout=20,
+                  )
+                  resp.raise_for_status()
+                  data = resp.json()
+                  videos = data.get("videos", [])
+                  if not videos:
+                      print(f"Aucun résultat pour '{keyword}', on ignore.")
+                      continue
+
+                  # On choisit le fichier vidéo de qualité "hd" le plus proche de 1080p vertical
+                  video_files = videos[0]["video_files"]
+                  best = min(
+                      video_files,
+                      key=lambda vf: abs((vf.get("height") or 0) - 1920),
+                  )
+                  video_url = best["link"]
+
+                  clip_path = f"clip_{i}.mp4"
+                  video_data = requests.get(video_url, timeout=60)
+                  with open(clip_path, "wb") as out:
+                      out.write(video_data.content)
+
+                  downloaded.append(clip_path)
+                  print(f"Téléchargé : {clip_path} (mot-clé: {keyword})")
+
+              except Exception as e:
+                  print(f"Erreur pour le mot-clé '{keyword}': {e}")
+
+          with open("clips_list.txt", "w") as f:
+              f.write("\n".join(downloaded))
+
+          print(f"{len(downloaded)} clip(s) téléchargé(s) au total.")
+          EOF
+
+      # --- Étape future à ajouter ici ---
+      # - name: Assembler la vidéo (FFmpeg)
+
+      - name: Confirmer sur Telegram (mots-clés + clips)
+        run: |
+          KEYWORDS=$(cat keywords.txt | tr '\n' ',' | sed 's/,/, /g')
+          NB_CLIPS=$(wc -l < clips_list.txt | tr -d ' ')
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ github.event.client_payload.chat_id }}" \
+            -d text="🎬 Mots-clés extraits : ${KEYWORDS}
+${NB_CLIPS} clip(s) Pexels téléchargé(s). Prochaine étape : le montage final avec FFmpeg."
