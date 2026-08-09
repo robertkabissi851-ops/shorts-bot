@@ -139,6 +139,13 @@ jobs:
           print(f"{len(downloaded)} clip(s) téléchargé(s) au total.")
           EOF
 
+      - name: Installer ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
       - name: Assembler la vidéo finale (FFmpeg)
         run: |
           python3 <<'EOF'
