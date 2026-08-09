@@ -43,10 +43,12 @@ jobs:
           with open("lang.txt", "w") as f:
               f.write(lang)
 
-          # Voix masculines dynamiques edge-tts
+          # Voix masculines dynamiques — les versions "Multilingual" utilisent un modèle
+          # plus récent, avec une prosodie et des liaisons nettement plus naturelles
+          # que les voix "classiques" (Henri, Guy)
           voices = {
-              "fr": "fr-FR-HenriNeural",
-              "en": "en-US-GuyNeural",
+              "fr": "fr-FR-RemyMultilingualNeural",
+              "en": "en-US-AndrewMultilingualNeural",
           }
           voice = voices.get(lang, voices["fr"])
 
@@ -55,6 +57,7 @@ jobs:
           subprocess.run([
               "edge-tts",
               "--voice", voice,
+              "--rate=-8%",
               "--text", text,
               "--write-media", "voix_off.mp3"
           ], check=True)
@@ -146,10 +149,22 @@ jobs:
           ffmpeg -version
           ffprobe -version
 
+      - name: Choisir une musique de fond
+        run: |
+          if ls music/*.mp3 >/dev/null 2>&1; then
+            MUSIC_FILE=$(ls music/*.mp3 | shuf -n 1)
+            echo "Musique choisie : $MUSIC_FILE"
+            echo "MUSIC_FILE=$MUSIC_FILE" >> "$GITHUB_ENV"
+          else
+            echo "Aucune musique trouvée dans music/, la vidéo sera générée sans musique de fond."
+            echo "MUSIC_FILE=" >> "$GITHUB_ENV"
+          fi
+
       - name: Assembler la vidéo finale (FFmpeg)
         run: |
           python3 <<'EOF'
           import subprocess
+          import os
 
           def ffprobe_duration(path):
               result = subprocess.run(
@@ -220,17 +235,36 @@ jobs:
               "video_concat.mp4"
           ], check=True)
 
-          # 3. On mixe la voix off (au premier plan) avec le son des clips (fond sonore léger)
-          subprocess.run([
-              "ffmpeg", "-y",
-              "-i", "video_concat.mp4",
-              "-i", "voix_off.mp3",
-              "-filter_complex",
-              "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
-              "-map", "0:v", "-map", "[aout]",
-              "-c:v", "copy", "-shortest",
-              "short_final.mp4"
-          ], check=True)
+          # 3. On mixe la voix off (au premier plan), le son des clips (fond très léger)
+          #    et la musique de fond si disponible (mise en boucle et coupée à la bonne durée)
+          music_file = os.environ.get("MUSIC_FILE", "").strip()
+
+          if music_file:
+              subprocess.run([
+                  "ffmpeg", "-y",
+                  "-i", "video_concat.mp4",
+                  "-i", "voix_off.mp3",
+                  "-stream_loop", "-1", "-i", music_file,
+                  "-filter_complex",
+                  "[0:a]volume=0.10[bg];"
+                  "[1:a]volume=1.0[voice];"
+                  f"[2:a]atrim=0:{audio_duration},volume=0.12[music];"
+                  "[bg][voice][music]amix=inputs=3:duration=first:dropout_transition=2[aout]",
+                  "-map", "0:v", "-map", "[aout]",
+                  "-c:v", "copy", "-shortest",
+                  "short_final.mp4"
+              ], check=True)
+          else:
+              subprocess.run([
+                  "ffmpeg", "-y",
+                  "-i", "video_concat.mp4",
+                  "-i", "voix_off.mp3",
+                  "-filter_complex",
+                  "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
+                  "-map", "0:v", "-map", "[aout]",
+                  "-c:v", "copy", "-shortest",
+                  "short_final.mp4"
+              ], check=True)
 
           print("Vidéo finale générée : short_final.mp4")
           EOF
