@@ -69,7 +69,7 @@ jobs:
           )
 
           resp = requests.post(
-              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
               params={"key": os.environ["GEMINI_API_KEY"]},
               json={
                   "contents": [{"parts": [{"text": f"{system_prompt}\n\nScript :\n{script}"}]}],
@@ -140,7 +140,7 @@ jobs:
                   'un JSON de cette forme : {"search_term": "..."}'
               )
               resp = requests.post(
-                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
                   params={"key": gemini_key},
                   json={
                       "contents": [{"parts": [{"text": prompt}]}],
