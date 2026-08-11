@@ -1,4 +1,4 @@
-name: Générer un Short
+name: Générer un Short (v2 - IA scénariste)
 
 # Déclenché à distance par le Worker Cloudflare via repository_dispatch
 on:
@@ -23,13 +23,12 @@ jobs:
       - name: Installer Python et les dépendances
         run: |
           python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet edge-tts langdetect yake requests
+          python3 -m pip install --quiet edge-tts langdetect requests
 
-      - name: Générer la voix off (edge-tts)
+      - name: Détecter la langue du script
         run: |
           python3 <<'EOF'
           from langdetect import detect
-          import subprocess
 
           with open("script.txt", "r", encoding="utf-8") as f:
               text = f.read().strip()
@@ -37,109 +36,183 @@ jobs:
           try:
               lang = detect(text)
           except Exception:
-              lang = "fr"  # repli par défaut si la détection échoue
+              lang = "fr"
 
-          # On sauvegarde la langue détectée pour la réutiliser dans les étapes suivantes
           with open("lang.txt", "w") as f:
               f.write(lang)
 
-          # Voix masculines dynamiques — les versions "Multilingual" utilisent un modèle
-          # plus récent, avec une prosodie et des liaisons nettement plus naturelles
-          # que les voix "classiques" (Henri, Guy)
+          print(f"Langue détectée : {lang}")
+          EOF
+
+      - name: Découper le script en scènes (Gemini)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 <<'EOF'
+          import os
+          import json
+          import requests
+
+          with open("script.txt", "r", encoding="utf-8") as f:
+              script = f.read().strip()
+
+          system_prompt = (
+              "Tu es un réalisateur vidéo spécialisé dans les Shorts. Reçois ce script de "
+              "voix off. Découpe-le en séquences de 4 à 5 secondes de lecture orale (garde "
+              "le texte exact du script, ne le reformule pas, ne le traduis pas). Pour chaque "
+              "séquence, fournis : 1) le segment de texte exact (dans la langue d'origine du "
+              "script), 2) deux mots-clés précis EN ANGLAIS pour trouver une vidéo d'illustration "
+              "sur Pexels. Évite les concepts abstraits (ex: 'succès'), utilise du concret "
+              "(ex: 'man in suit raising hands', 'office timelapse'). Réponds uniquement avec "
+              "un tableau JSON de cette forme, sans aucun texte autour : "
+              '[{"text": "...", "search_term": "..."}]'
+          )
+
+          resp = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+              params={"key": os.environ["GEMINI_API_KEY"]},
+              json={
+                  "contents": [{"parts": [{"text": f"{system_prompt}\n\nScript :\n{script}"}]}],
+                  "generationConfig": {"responseMimeType": "application/json"},
+              },
+              timeout=30,
+          )
+          resp.raise_for_status()
+          data = resp.json()
+          raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+          scenes = json.loads(raw_text)
+
+          if not scenes:
+              raise SystemExit("Gemini n'a renvoyé aucune scène.")
+
+          print(f"{len(scenes)} scène(s) générée(s) :")
+          for s in scenes:
+              print(f"  - \"{s['text'][:50]}...\" -> {s['search_term']}")
+
+          with open("scenes.json", "w", encoding="utf-8") as f:
+              json.dump(scenes, f, ensure_ascii=False, indent=2)
+          EOF
+
+      - name: Générer la voix off et télécharger les clips, scène par scène
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 <<'EOF'
+          import os
+          import json
+          import subprocess
+          import requests
+
+          with open("scenes.json", "r", encoding="utf-8") as f:
+              scenes = json.load(f)
+          with open("lang.txt") as f:
+              lang = f.read().strip()
+
           voices = {
               "fr": "fr-FR-RemyMultilingualNeural",
               "en": "en-US-AndrewMultilingualNeural",
           }
           voice = voices.get(lang, voices["fr"])
 
-          print(f"Langue détectée : {lang} -> voix choisie : {voice}")
+          pexels_headers = {"Authorization": os.environ["PEXELS_API_KEY"]}
+          gemini_key = os.environ["GEMINI_API_KEY"]
 
-          subprocess.run([
-              "edge-tts",
-              "--voice", voice,
-              "--rate=-8%",
-              "--text", text,
-              "--write-media", "voix_off.mp3"
-          ], check=True)
-          EOF
+          # Filet de sécurité ultime si même le fallback Gemini échoue,
+          # pour ne jamais planter tout le pipeline sur une seule scène
+          GENERIC_FALLBACKS = ["nature landscape", "city timelapse", "abstract background"]
 
-      - name: Extraire les mots-clés du script (yake)
-        run: |
-          python3 <<'EOF'
-          import yake
+          def search_pexels(query):
+              resp = requests.get(
+                  "https://api.pexels.com/videos/search",
+                  headers=pexels_headers,
+                  params={"query": query, "orientation": "portrait", "per_page": 1},
+                  timeout=20,
+              )
+              resp.raise_for_status()
+              return resp.json().get("videos", [])
 
-          with open("script.txt", "r", encoding="utf-8") as f:
-              text = f.read().strip()
-          with open("lang.txt", "r") as f:
-              lang = f.read().strip()
+          def ask_gemini_simpler_term(original_term):
+              prompt = (
+                  f"Le terme de recherche vidéo '{original_term}' n'a donné aucun résultat sur "
+                  "Pexels. Donne UN SEUL terme de recherche en anglais, plus simple et plus "
+                  "générique (2-3 mots maximum), pour du stock-footage. Réponds uniquement avec "
+                  'un JSON de cette forme : {"search_term": "..."}'
+              )
+              resp = requests.post(
+                  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+                  params={"key": gemini_key},
+                  json={
+                      "contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"responseMimeType": "application/json"},
+                  },
+                  timeout=30,
+              )
+              resp.raise_for_status()
+              raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+              return json.loads(raw)["search_term"]
 
-          # yake ne connaît que "fr"/"en" etc., déjà compatible avec langdetect
-          extractor = yake.KeywordExtractor(lan=lang, n=1, top=5, dedupLim=0.9)
-          keywords = [kw for kw, score in extractor.extract_keywords(text)]
+          def ffprobe_duration(path):
+              result = subprocess.run(
+                  ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                  capture_output=True, text=True, check=True
+              )
+              return float(result.stdout.strip())
 
-          if not keywords:
-              keywords = ["nature", "ville", "mouvement"]  # repli si extraction vide
+          scene_audio_files = []
+          scene_clip_files = []
 
-          print("Mots-clés extraits :", keywords)
+          for i, scene in enumerate(scenes):
+              text = scene["text"]
+              search_term = scene["search_term"]
 
-          with open("keywords.txt", "w", encoding="utf-8") as f:
-              f.write("\n".join(keywords))
-          EOF
+              # 1. Voix off de cette scène précisément (durée exacte connue ensuite)
+              audio_path = f"scene_audio_{i}.mp3"
+              subprocess.run([
+                  "edge-tts", "--voice", voice, "--rate=-8%",
+                  "--text", text, "--write-media", audio_path
+              ], check=True)
+              scene_audio_files.append(audio_path)
 
-      - name: Télécharger les clips vidéo (API Pexels)
-        env:
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        run: |
-          python3 <<'EOF'
-          import os
-          import requests
+              # 2. Recherche du clip Pexels, avec fallback Gemini si rien trouvé
+              videos = search_pexels(search_term)
+              used_term = search_term
 
-          api_key = os.environ["PEXELS_API_KEY"]
-          headers = {"Authorization": api_key}
+              if not videos:
+                  try:
+                      simpler_term = ask_gemini_simpler_term(search_term)
+                      print(f"Scène {i} : fallback Gemini '{search_term}' -> '{simpler_term}'")
+                      videos = search_pexels(simpler_term)
+                      used_term = simpler_term
+                  except Exception as e:
+                      print(f"Scène {i} : échec du fallback Gemini ({e})")
 
-          with open("keywords.txt", "r", encoding="utf-8") as f:
-              keywords = [line.strip() for line in f if line.strip()]
+              if not videos:
+                  for generic in GENERIC_FALLBACKS:
+                      videos = search_pexels(generic)
+                      if videos:
+                          used_term = generic
+                          print(f"Scène {i} : filet de sécurité générique -> '{generic}'")
+                          break
 
-          downloaded = []
+              if not videos:
+                  raise SystemExit(f"Scène {i} : impossible de trouver un clip, même en secours.")
 
-          for i, keyword in enumerate(keywords):
-              try:
-                  resp = requests.get(
-                      "https://api.pexels.com/videos/search",
-                      headers=headers,
-                      params={"query": keyword, "orientation": "portrait", "per_page": 1},
-                      timeout=20,
-                  )
-                  resp.raise_for_status()
-                  data = resp.json()
-                  videos = data.get("videos", [])
-                  if not videos:
-                      print(f"Aucun résultat pour '{keyword}', on ignore.")
-                      continue
+              video_files = videos[0]["video_files"]
+              best = min(video_files, key=lambda vf: abs((vf.get("height") or 0) - 1920))
+              clip_path = f"scene_clip_{i}.mp4"
+              video_data = requests.get(best["link"], timeout=60)
+              with open(clip_path, "wb") as out:
+                  out.write(video_data.content)
+              scene_clip_files.append(clip_path)
 
-                  # On choisit le fichier vidéo de qualité "hd" le plus proche de 1080p vertical
-                  video_files = videos[0]["video_files"]
-                  best = min(
-                      video_files,
-                      key=lambda vf: abs((vf.get("height") or 0) - 1920),
-                  )
-                  video_url = best["link"]
+              duration = ffprobe_duration(audio_path)
+              print(f"Scène {i} : \"{text[:40]}...\" -> mot-clé '{used_term}', audio {duration:.2f}s")
 
-                  clip_path = f"clip_{i}.mp4"
-                  video_data = requests.get(video_url, timeout=60)
-                  with open(clip_path, "wb") as out:
-                      out.write(video_data.content)
-
-                  downloaded.append(clip_path)
-                  print(f"Téléchargé : {clip_path} (mot-clé: {keyword})")
-
-              except Exception as e:
-                  print(f"Erreur pour le mot-clé '{keyword}': {e}")
-
-          with open("clips_list.txt", "w") as f:
-              f.write("\n".join(downloaded))
-
-          print(f"{len(downloaded)} clip(s) téléchargé(s) au total.")
+          with open("scene_audio_list.txt", "w") as f:
+              f.write("\n".join(scene_audio_files))
+          with open("scene_clip_list.txt", "w") as f:
+              f.write("\n".join(scene_clip_files))
           EOF
 
       - name: Installer ffmpeg
@@ -160,7 +233,7 @@ jobs:
             echo "MUSIC_FILE=" >> "$GITHUB_ENV"
           fi
 
-      - name: Assembler la vidéo finale (FFmpeg)
+      - name: Assembler la vidéo finale, scène par scène (FFmpeg)
         run: |
           python3 <<'EOF'
           import subprocess
@@ -181,38 +254,34 @@ jobs:
               )
               return bool(result.stdout.strip())
 
-          with open("clips_list.txt") as f:
-              clips = [line.strip() for line in f if line.strip()]
+          with open("scene_audio_list.txt") as f:
+              scene_audios = [line.strip() for line in f if line.strip()]
+          with open("scene_clip_list.txt") as f:
+              scene_clips = [line.strip() for line in f if line.strip()]
 
-          if not clips:
-              raise SystemExit("Aucun clip téléchargé, impossible d'assembler la vidéo.")
+          if not scene_clips:
+              raise SystemExit("Aucune scène à assembler.")
 
-          audio_duration = ffprobe_duration("voix_off.mp3")
-          per_clip_duration = audio_duration / len(clips)
-          print(f"Durée audio : {audio_duration:.2f}s -> {per_clip_duration:.2f}s par clip ({len(clips)} clips)")
-
-          # 1. On découpe et recadre chaque clip en format vertical 1080x1920,
-          #    avec une durée et un framerate identiques pour tous (nécessaire au concat),
-          #    et on ajoute une piste audio silencieuse si le clip original n'en a pas.
           video_filter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
           segment_files = []
-          for i, clip in enumerate(clips):
+
+          # Chaque clip est calé EXACTEMENT sur la durée de la voix off de sa propre scène
+          for i, (audio, clip) in enumerate(zip(scene_audios, scene_clips)):
+              duration = ffprobe_duration(audio)
               segment = f"segment_{i}.mp4"
               if has_audio(clip):
                   cmd = [
-                      "ffmpeg", "-y", "-i", clip, "-t", str(per_clip_duration),
+                      "ffmpeg", "-y", "-i", clip, "-t", str(duration),
                       "-vf", video_filter,
                       "-c:v", "libx264", "-preset", "veryfast",
                       "-c:a", "aac", "-ar", "44100", "-ac", "2",
                       segment
                   ]
               else:
-                  # Pas d'audio dans ce clip -> on génère une piste silencieuse
-                  # pour garder la même structure que les autres segments
                   cmd = [
                       "ffmpeg", "-y", "-i", clip,
                       "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                      "-t", str(per_clip_duration),
+                      "-t", str(duration),
                       "-vf", video_filter,
                       "-map", "0:v", "-map", "1:a",
                       "-c:v", "libx264", "-preset", "veryfast",
@@ -223,27 +292,33 @@ jobs:
               subprocess.run(cmd, check=True)
               segment_files.append(segment)
 
-          # 2. On met les segments bout à bout (ré-encodage, pas de stream copy,
-          #    pour éviter tout souci de paramètres légèrement différents)
-          with open("concat_list.txt", "w") as f:
+          # On met les segments vidéo bout à bout
+          with open("concat_video_list.txt", "w") as f:
               for seg in segment_files:
                   f.write(f"file '{seg}'\n")
-
           subprocess.run([
-              "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat_list.txt",
+              "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat_video_list.txt",
               "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
               "video_concat.mp4"
           ], check=True)
 
-          # 3. On mixe la voix off (au premier plan), le son des clips (fond très léger)
-          #    et la musique de fond si disponible (mise en boucle et coupée à la bonne durée)
+          # On met les voix off de chaque scène bout à bout (narration complète et synchronisée)
+          with open("concat_audio_list.txt", "w") as f:
+              for a in scene_audios:
+                  f.write(f"file '{a}'\n")
+          subprocess.run([
+              "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat_audio_list.txt",
+              "-c", "copy", "voix_off_full.mp3"
+          ], check=True)
+
+          audio_duration = ffprobe_duration("voix_off_full.mp3")
           music_file = os.environ.get("MUSIC_FILE", "").strip()
 
           if music_file:
               subprocess.run([
                   "ffmpeg", "-y",
                   "-i", "video_concat.mp4",
-                  "-i", "voix_off.mp3",
+                  "-i", "voix_off_full.mp3",
                   "-stream_loop", "-1", "-i", music_file,
                   "-filter_complex",
                   "[0:a]volume=0.10[bg];"
@@ -258,7 +333,7 @@ jobs:
               subprocess.run([
                   "ffmpeg", "-y",
                   "-i", "video_concat.mp4",
-                  "-i", "voix_off.mp3",
+                  "-i", "voix_off_full.mp3",
                   "-filter_complex",
                   "[0:a]volume=0.15[bg];[1:a]volume=1.0[voice];[bg][voice]amix=inputs=2:duration=longest:dropout_transition=2[aout]",
                   "-map", "0:v", "-map", "[aout]",
@@ -274,4 +349,4 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendVideo" \
             -F chat_id="${{ github.event.client_payload.chat_id }}" \
             -F video=@short_final.mp4 \
-            -F caption="🎉 Ton Short est prêt !"
+            -F caption="🎉 Ton Short est prêt (v2 - IA scénariste) !"
