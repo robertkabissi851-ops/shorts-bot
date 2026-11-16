@@ -350,3 +350,57 @@ jobs:
             -F chat_id="${{ github.event.client_payload.chat_id }}" \
             -F video=@short_final.mp4 \
             -F caption="🎉 Ton Short est prêt (v2 - IA scénariste) !"
+
+      # Si cette étape échoue, la vidéo a déjà été envoyée : on ne fait pas échouer tout le job
+      - name: Générer titre, description et hashtags (Gemini)
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          python3 <<'EOF'
+          import os
+          import json
+          import requests
+
+          with open("script.txt", "r", encoding="utf-8") as f:
+              script = f.read().strip()
+
+          prompt = (
+              "Tu aides un créateur de YouTube Shorts. À partir du script de voix off ci-dessous, "
+              "écris : 1) un titre accrocheur de 70 caractères maximum, honnête (pas de promesse "
+              "mensongère), 2) une description de 2 à 3 phrases, 3) 8 hashtags pertinents dont "
+              "#Shorts. Écris dans la langue du script. Réponds uniquement avec un JSON de cette "
+              'forme : {"title": "...", "description": "...", "hashtags": ["#...", "#..."]}'
+              f"\n\nScript :\n{script}"
+          )
+
+          resp = requests.post(
+              "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+              headers={"x-goog-api-key": os.environ["GEMINI_API_KEY"]},
+              json={
+                  "contents": [{"parts": [{"text": prompt}]}],
+                  "generationConfig": {"responseMimeType": "application/json"},
+              },
+              timeout=30,
+          )
+          resp.raise_for_status()
+          raw = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+          data = json.loads(raw)
+
+          hashtags = " ".join(data["hashtags"])
+          message = (
+              "📋 Prêt à copier pour la publication\n\n"
+              f"Titre :\n{data['title']}\n\n"
+              f"Description :\n{data['description']}\n\n"
+              f"{hashtags}"
+          )
+
+          requests.post(
+              f"https://api.telegram.org/bot{os.environ['TELEGRAM_BOT_TOKEN']}/sendMessage",
+              json={"chat_id": os.environ["CHAT_ID"], "text": message},
+              timeout=20,
+          )
+          print("Titre, description et hashtags envoyés.")
+          EOF
